@@ -5,6 +5,7 @@ const os = require('os');
 const fs = require('fs');
 const crypto = require('crypto');
 
+const PORT = process.env.PORT || 3000;
 const DESTINO = {
   host: 'api-svsaude-hcommerce.hmg.marlin.com.br',
   port: 80

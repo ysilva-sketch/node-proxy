@@ -1,0 +1,13 @@
+{
+  "name": "node-proxy-interceptor",
+  "version": "1.0.0",
+  "description": "Middleware de inspeção e encaminhamento HTTP",
+  "main": "server-raw.js",
+  "scripts": {
+    "start": "node server-raw.js"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
