@@ -1,13 +1,19 @@
 {
-  "name": "node-proxy-interceptor",
+  "name": "express-proxy-api",
   "version": "1.0.0",
-  "description": "Middleware de inspeção e encaminhamento HTTP",
-  "main": "server-raw.js",
+  "description": "API Proxy com logging completo para Render",
+  "main": "server.js",
   "scripts": {
-    "start": "node server-raw.js"
+    "start": "node server.js"
   },
-  "dependencies": {},
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "axios": "^1.6.0",
+    "express-fileupload": "^1.4.0",
+    "morgan": "^1.10.0"
+  },
   "engines": {
-    "node": ">=14.0.0"
+    "node": "18.x"
   }
 }
