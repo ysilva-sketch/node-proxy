@@ -7,7 +7,4 @@
     "start": "node server-raw.js"
   },
   "dependencies": {},
-  "engines": {
-    "node": ">=14.0.0"
-  }
 }
