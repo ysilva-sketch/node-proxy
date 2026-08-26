@@ -1,364 +1,480 @@
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const fileUpload = require('express-fileupload');
-const morgan = require('morgan');
+// server-raw.js
+const http = require('http');
+const url = require('url');
+const os = require('os');
 const fs = require('fs');
-const path = require('path');
-const FormData = require('form-data');
-const { Readable } = require('stream');
+const crypto = require('crypto');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// ===== CONFIGURAÇÕES =====
-const TARGET_SERVER = {
-  baseURL: process.env.TARGET_URL || 'https://api-svsaude-hcommerce.hmg.marlin.com.br',
-  timeout: 30000 // 30 segundos para arquivos grandes
+const PORT = 3000;
+const DESTINO = {
+  host: 'localhost',
+  port: 60913
 };
 
-// ===== MIDDLEWARES =====
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: '*',
-  credentials: true,
-  exposedHeaders: '*'
-}));
-
-app.use(express.json({ limit: '100mb' }));
-app.use(express.urlencoded({ extended: true, limit: '100mb' }));
-
-// Configuração específica para file upload
-app.use(fileUpload({
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
-  createParentPath: true,
-  parseNested: true,
-  abortOnLimit: true,
-  responseOnLimit: 'Arquivo muito grande. Máximo: 100MB'
-}));
-
-// Logging detalhado
-app.use(morgan('dev'));
-
-// ===== ROTA DE HEALTH CHECK =====
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'OK',
-    timestamp: new Date().toISOString(),
-    target: TARGET_SERVER.baseURL,
-    nodeVersion: process.version,
-    uptime: process.uptime(),
-    memory: process.memoryUsage()
-  });
-});
-
-// ===== ROTA PARA VER LOGS =====
-app.get('/logs', (req, res) => {
-  try {
-    const logPath = path.join(__dirname, 'proxy-logs.json');
-    if (fs.existsSync(logPath)) {
-      const logs = fs.readFileSync(logPath, 'utf8');
-      const logData = JSON.parse(logs);
-      res.json({
-        total: logData.length,
-        logs: logData.slice(-100)
-      });
-    } else {
-      res.json({ total: 0, logs: [] });
-    }
-  } catch (error) {
-    res.status(500).json({ error: 'Erro ao ler logs', message: error.message });
-  }
-});
-
-// ===== FUNÇÃO PARA SALVAR LOG =====
-function saveLog(logEntry) {
-  try {
-    const logPath = path.join(__dirname, 'proxy-logs.json');
-    let logs = [];
-    
-    if (fs.existsSync(logPath)) {
-      const data = fs.readFileSync(logPath, 'utf8');
-      logs = JSON.parse(data);
-    }
-    
-    logs.push(logEntry);
-    
-    if (logs.length > 1000) {
-      logs = logs.slice(-1000);
-    }
-    
-    fs.writeFileSync(logPath, JSON.stringify(logs, null, 2));
-  } catch (error) {
-    console.error('Erro ao salvar log:', error.message);
-  }
-}
-
-// ===== FUNÇÃO PARA CONVERTER BUFFER EM STREAM =====
-function bufferToStream(buffer) {
-  const readable = new Readable();
-  readable._read = () => {};
-  readable.push(buffer);
-  readable.push(null);
-  return readable;
-}
-
-// ===== MIDDLEWARE DE INTERCEPTAÇÃO =====
-app.use(async (req, res, next) => {
-  // Ignora rotas internas
-  if (req.path.startsWith('/health') || req.path.startsWith('/logs')) {
-    return next();
-  }
-
-  const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-  const startTime = Date.now();
-
-  // Log da requisição
-  console.log('\n' + '='.repeat(80));
-  console.log(`📨 REQUISIÇÃO #${requestId}`);
-  console.log('='.repeat(80));
-  console.log(`📌 Método: ${req.method}`);
-  console.log(`📍 URL: ${req.url}`);
-  console.log(`🖥️  IP: ${req.ip || req.connection.remoteAddress}`);
+function parseMultipart(body, boundary) {
+  const result = {
+    fields: {},
+    files: []
+  };
   
-  // Verifica se tem arquivos
-  const hasFiles = req.files && Object.keys(req.files).length > 0;
-  if (hasFiles) {
-    console.log(`📎 Arquivos recebidos:`);
-    Object.keys(req.files).forEach(key => {
-      const file = req.files[key];
-      console.log(`   - ${key}: ${file.name} (${file.mimetype}, ${file.size} bytes)`);
-    });
-  }
-
-  console.log(`📦 Body:`, JSON.stringify(req.body, null, 2));
-  console.log('='.repeat(80));
-
-  // Salva log da requisição
-  saveLog({
-    type: 'request',
-    id: requestId,
-    timestamp: new Date().toISOString(),
-    method: req.method,
-    url: req.url,
-    path: req.path,
-    query: req.query,
-    headers: req.headers,
-    ip: req.ip || req.connection.remoteAddress,
-    hasFiles: hasFiles,
-    files: hasFiles ? Object.keys(req.files).map(k => ({
-      name: req.files[k].name,
-      mimetype: req.files[k].mimetype,
-      size: req.files[k].size
-    })) : []
-  });
-
-  // ===== ENCAMINHA PARA O SERVIDOR DESTINO =====
-  try {
-    const targetURL = TARGET_SERVER.baseURL + req.url;
-    console.log(`➡️ Encaminhando para: ${targetURL}`);
-
-    // Prepara headers
-    const headers = { ...req.headers };
-    delete headers['host'];
-    delete headers['connection'];
-    delete headers['content-length'];
-    delete headers['transfer-encoding'];
-    delete headers['accept-encoding'];
-
-    // Adiciona headers de proxy
-    headers['x-forwarded-for'] = req.ip || req.connection.remoteAddress;
-    headers['x-forwarded-proto'] = req.protocol || 'https';
-    headers['x-proxy-server'] = 'express-proxy-api';
-    headers['x-request-id'] = requestId;
-
-    let response;
-
-    // ===== CASO 1: REQUISIÇÃO COM ARQUIVOS =====
-    if (hasFiles) {
-      console.log('📤 Processando upload de arquivos...');
+  const parts = body.split('--' + boundary);
+  
+  parts.forEach(function(part) {
+    let cleanPart = part.replace(/--\s*$/, '').trim();
+    if (!cleanPart || cleanPart === '--') return;
+    
+    const separatorIndex = cleanPart.indexOf('\r\n\r\n');
+    if (separatorIndex === -1) return;
+    
+    const headerSection = cleanPart.substring(0, separatorIndex);
+    const content = cleanPart.substring(separatorIndex + 4);
+    
+    const contentDisposition = headerSection.match(/Content-Disposition: form-data; name="([^"]+)"(?:; filename="([^"]+)")?/i);
+    const contentType = headerSection.match(/Content-Type: (.+)/i);
+    
+    if (contentDisposition) {
+      const name = contentDisposition[1];
+      const filename = contentDisposition[2];
       
-      const formData = new FormData();
-      
-      // Adiciona campos do body
-      Object.keys(req.body).forEach(key => {
-        if (req.body[key] !== undefined && req.body[key] !== null) {
-          formData.append(key, req.body[key]);
-        }
-      });
-      
-      // Adiciona arquivos
-      Object.keys(req.files).forEach(key => {
-        const file = req.files[key];
-        // Cria um buffer a partir dos dados do arquivo
-        const fileBuffer = file.data;
-        // Adiciona ao FormData com nome, buffer e nome do arquivo
-        formData.append(key, fileBuffer, {
-          filename: file.name,
-          contentType: file.mimetype || 'application/octet-stream'
+      if (filename) {
+        const fileContent = content.replace(/\r\n$/, '');
+        result.files.push({
+          fieldName: name,
+          filename: filename,
+          contentType: contentType ? contentType[1].trim() : 'application/octet-stream',
+          size: fileContent.length,
+          data: fileContent
         });
-        console.log(`   ✅ Arquivo adicionado: ${file.name} (${file.mimetype})`);
-      });
-
-      // Faz a requisição com FormData
-      response = await axios({
-        method: req.method,
-        url: targetURL,
-        headers: {
-          ...headers,
-          ...formData.getHeaders()
-        },
-        data: formData,
-        params: req.query,
-        timeout: TARGET_SERVER.timeout,
-        maxContentLength: Infinity,
-        maxBodyLength: Infinity,
-        validateStatus: () => true
-      });
-      
-    // ===== CASO 2: REQUISIÇÃO JSON =====
-    } else if (req.is('application/json') && Object.keys(req.body).length > 0) {
-      console.log('📤 Enviando JSON...');
-      response = await axios({
-        method: req.method,
-        url: targetURL,
-        headers: headers,
-        data: req.body,
-        params: req.query,
-        timeout: TARGET_SERVER.timeout,
-        validateStatus: () => true
-      });
-      
-    // ===== CASO 3: REQUISIÇÃO URL ENCODED =====
-    } else if (req.is('application/x-www-form-urlencoded') && Object.keys(req.body).length > 0) {
-      console.log('📤 Enviando URL Encoded...');
-      response = await axios({
-        method: req.method,
-        url: targetURL,
-        headers: {
-          ...headers,
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        data: new URLSearchParams(req.body).toString(),
-        params: req.query,
-        timeout: TARGET_SERVER.timeout,
-        validateStatus: () => true
-      });
-      
-    // ===== CASO 4: REQUISIÇÃO SEM BODY =====
-    } else {
-      console.log('📤 Enviando requisição sem body...');
-      response = await axios({
-        method: req.method,
-        url: targetURL,
-        headers: headers,
-        params: req.query,
-        timeout: TARGET_SERVER.timeout,
-        validateStatus: () => true
-      });
+      } else {
+        result.fields[name] = content.replace(/\r\n$/, '');
+      }
     }
+  });
+  
+  return result;
+}
 
-    const duration = Date.now() - startTime;
+function cleanHeaders(headers) {
+  const cleaned = {};
+  
+  // Headers que não devem ser encaminhados
+  const blockedHeaders = [
+    'host',
+    'connection',
+    'content-length',
+    'transfer-encoding',
+    'accept-encoding'
+  ];
+  
+  Object.keys(headers).forEach(function(key) {
+    const lowerKey = key.toLowerCase();
+    
+    if (blockedHeaders.includes(lowerKey)) {
+      return;
+    }
+    
+    if (headers[key] === undefined || headers[key] === null) {
+      return;
+    }
+    
+    cleaned[key] = headers[key];
+  });
+  
+  return cleaned;
+}
 
-    // Log da resposta
+const server = http.createServer(function(req, res) {
+  
+  // ============ RESPONDER PREFLIGHT OPTIONS ============
+  if (req.method === 'OPTIONS') {
     console.log('\n' + '='.repeat(80));
-    console.log(`⬅️ RESPOSTA #${requestId}`);
+    console.log('PREFLIGHT OPTIONS');
     console.log('='.repeat(80));
-    console.log(`📊 Status: ${response.status} ${response.statusText}`);
-    console.log(`⏱️  Duração: ${duration}ms`);
-    console.log(`📦 Tamanho: ${JSON.stringify(response.data).length} bytes`);
-    console.log('='.repeat(80) + '\n');
-
-    // Salva log da resposta
-    saveLog({
-      type: 'response',
-      id: requestId,
-      timestamp: new Date().toISOString(),
-      status: response.status,
-      statusText: response.statusText,
-      duration: duration + 'ms'
-    });
-
-    // Adiciona CORS headers
-    res.set({
+    console.log('URL: ' + req.url);
+    
+    res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, PATCH',
       'Access-Control-Allow-Headers': '*',
-      'Access-Control-Allow-Credentials': 'true',
-      'Access-Control-Expose-Headers': '*'
+      'Access-Control-Max-Age': '86400',
+      'Access-Control-Allow-Credentials': 'true'
     });
-
-    // Retorna a resposta
-    return res.status(response.status).json(response.data);
-
-  } catch (error) {
-    const duration = Date.now() - startTime;
+    res.end();
+    return;
+  }
+  
+  // ============ REQUISICAO REAL ============
+  const chunks = [];
+  let bodyBuffer;
+  
+  req.on('data', function(chunk) {
+    chunks.push(chunk);
+  });
+  
+  req.on('end', function() {
+    bodyBuffer = Buffer.concat(chunks);
+    const bodyString = bodyBuffer.toString();
+    const parsedUrl = url.parse(req.url, true);
+    const contentType = req.headers['content-type'] || '';
+    const isMultipart = contentType.includes('multipart/form-data');
     
     console.log('\n' + '='.repeat(80));
-    console.log(`❌ ERRO #${requestId}`);
+    console.log('📥 REQUISIÇÃO RECEBIDA');
     console.log('='.repeat(80));
-    console.log(`⏱️  Duração: ${duration}ms`);
-    console.log(`💥 Erro: ${error.message}`);
-    if (error.response) {
-      console.log(`📊 Status: ${error.response.status}`);
-      console.log(`📄 Data:`, error.response.data);
+    console.log('🕐 Data/Hora: ' + new Date().toLocaleString('pt-BR'));
+    console.log('🔗 URL Completa: ' + req.url);
+    console.log('📍 Path: ' + parsedUrl.pathname);
+    console.log('❓ Query String: ' + (parsedUrl.search || '(vazia)'));
+    console.log('📌 Método: ' + req.method);
+    console.log('🌐 IP Cliente: ' + req.socket.remoteAddress);
+    console.log('🖥️  User-Agent: ' + (req.headers['user-agent'] || '(não enviado)'));
+    console.log('📦 Content-Type: ' + (contentType || '(não enviado)'));
+    console.log('📏 Content-Length: ' + (req.headers['content-length'] || '0'));
+    
+    // ============ TODOS OS HEADERS ============
+    console.log('\n' + '🔷 TODOS OS HEADERS RECEBIDOS:');
+    console.log('─'.repeat(80));
+    const sortedHeaders = Object.keys(req.headers).sort();
+    sortedHeaders.forEach(function(key) {
+      const value = req.headers[key];
+      if (key.toLowerCase() === 'authorization') {
+        const parts = value.split(' ');
+        if (parts.length === 2) {
+          console.log('  ' + key + ': ' + parts[0] + ' ' + parts[1].substring(0, 20) + '... (tamanho: ' + parts[1].length + ' chars)');
+        } else {
+          console.log('  ' + key + ': ' + value.substring(0, 50) + '... (tamanho: ' + value.length + ' chars)');
+        }
+      } else {
+        console.log('  ' + key + ': ' + value);
+      }
+    });
+    
+    // ============ QUERY PARAMETERS ============
+    console.log('\n' + '🔶 QUERY PARAMETERS:');
+    console.log('─'.repeat(80));
+    if (Object.keys(parsedUrl.query).length > 0) {
+      console.log(JSON.stringify(parsedUrl.query, null, 2));
+    } else {
+      console.log('(Nenhum query parameter)');
     }
-    console.log('='.repeat(80) + '\n');
-
-    // Salva log do erro
-    saveLog({
-      type: 'error',
-      id: requestId,
-      timestamp: new Date().toISOString(),
-      error: error.message,
-      duration: duration + 'ms',
-      stack: error.stack
+    
+    // ============ PARÂMETROS DA URL ============
+    console.log('\n' + '🔶 PARÂMETROS DA URL (path segments):');
+    console.log('─'.repeat(80));
+    const pathParts = parsedUrl.pathname.split('/').filter(p => p);
+    if (pathParts.length > 0) {
+      pathParts.forEach(function(part, index) {
+        console.log('  [' + index + '] ' + part + (isNaN(part) ? '' : ' (número)'));
+      });
+    } else {
+      console.log('(Nenhum parâmetro na URL)');
+    }
+    
+    // ============ BODY COMPLETO ============
+    console.log('\n' + '🔷 BODY RECEBIDO:');
+    console.log('─'.repeat(80));
+    console.log('Tamanho: ' + bodyBuffer.length + ' bytes (' + (bodyBuffer.length / 1024).toFixed(2) + ' KB)');
+    
+    if (bodyBuffer.length === 0) {
+      console.log('(Body vazio)');
+    } else if (isMultipart) {
+      const boundaryMatch = contentType.match(/boundary=(.+)/);
+      if (boundaryMatch) {
+        const boundary = boundaryMatch[1];
+        console.log('Tipo: MULTIPART/FORM-DATA');
+        console.log('Boundary: ' + boundary);
+        
+        // Mostra o body cru
+        console.log('\n📄 BODY CRU (primeiros 1000 caracteres):');
+        console.log('─'.repeat(80));
+        console.log(bodyString.substring(0, 1000) + (bodyString.length > 1000 ? '...\n(continua...)' : ''));
+        
+        const parsed = parseMultipart(bodyString, boundary);
+        
+        console.log('\n📝 CAMPOS DE TEXTO:');
+        console.log('─'.repeat(80));
+        if (Object.keys(parsed.fields).length > 0) {
+          Object.keys(parsed.fields).forEach(function(key) {
+            console.log('  ' + key + ': ' + parsed.fields[key]);
+          });
+        } else {
+          console.log('  (Nenhum campo de texto)');
+        }
+        
+        console.log('\n📎 ARQUIVOS (' + parsed.files.length + '):');
+        console.log('─'.repeat(80));
+        if (parsed.files.length > 0) {
+          parsed.files.forEach(function(file, index) {
+            console.log('\n  Arquivo #' + (index + 1) + ':');
+            console.log('    Nome do campo: ' + file.fieldName);
+            console.log('    Nome do arquivo: ' + file.filename);
+            console.log('    Content-Type: ' + file.contentType);
+            console.log('    Tamanho: ' + (file.size / 1024).toFixed(2) + ' KB (' + file.size + ' bytes)');
+            
+            // Detecta tipo do arquivo
+            const hexPreview = Buffer.from(file.data.substring(0, 30)).toString('hex');
+            let fileType = 'Desconhecido';
+            const hex = hexPreview.toLowerCase();
+            if (hex.startsWith('89504e47')) fileType = 'PNG Image';
+            else if (hex.startsWith('ffd8ff')) fileType = 'JPEG Image';
+            else if (hex.startsWith('47494638')) fileType = 'GIF Image';
+            else if (hex.startsWith('25504446')) fileType = 'PDF Document';
+            else if (hex.startsWith('504b0304')) fileType = 'ZIP/Office Document';
+            else if (hex.startsWith('7b')) fileType = 'JSON File';
+            else if (hex.startsWith('3c')) fileType = 'HTML/XML File';
+            
+            console.log('    Tipo detectado: ' + fileType);
+            console.log('    Hex preview: ' + hexPreview);
+            console.log('    Dados (primeiros 200 bytes):');
+            console.log('    ' + file.data.substring(0, 200).replace(/\n/g, '\\n').replace(/\r/g, '\\r') + (file.data.length > 200 ? '...' : ''));
+            
+            // Salva o arquivo
+            const uploadDir = './uploads';
+            if (!fs.existsSync(uploadDir)) {
+              fs.mkdirSync(uploadDir, { recursive: true });
+            }
+            
+            const timestamp = Date.now();
+            const random = crypto.randomBytes(4).toString('hex');
+            const fileName = timestamp + '_' + random + '_' + file.filename;
+            const filePath = uploadDir + '/' + fileName;
+            
+            try {
+              fs.writeFileSync(filePath, file.data);
+              console.log('    💾 Salvo em: ' + filePath);
+            } catch (err) {
+              console.log('    ❌ Erro ao salvar: ' + err.message);
+            }
+          });
+        } else {
+          console.log('  (Nenhum arquivo)');
+        }
+        
+        console.log('\n📊 RESUMO DO FORM-DATA:');
+        console.log('─'.repeat(80));
+        console.log('  Campos de texto: ' + Object.keys(parsed.fields).length);
+        console.log('  Arquivos: ' + parsed.files.length);
+        const totalFilesSize = parsed.files.reduce(function(sum, f) { return sum + f.size; }, 0);
+        console.log('  Tamanho total arquivos: ' + (totalFilesSize / 1024).toFixed(2) + ' KB');
+        
+      } else {
+        console.log('❌ Boundary não encontrado no Content-Type');
+        console.log(bodyString);
+      }
+    } else if (contentType.includes('application/json')) {
+      console.log('Tipo: JSON');
+      try {
+        const jsonBody = JSON.parse(bodyString);
+        console.log('\n📄 CONTEÚDO JSON:');
+        console.log('─'.repeat(80));
+        console.log(JSON.stringify(jsonBody, null, 2));
+      } catch (e) {
+        console.log('❌ Erro ao parsear JSON:');
+        console.log(bodyString);
+      }
+    } else {
+      console.log('Tipo: ' + (contentType || 'text/plain'));
+      console.log('\n📄 CONTEÚDO DO BODY:');
+      console.log('─'.repeat(80));
+      console.log(bodyString);
+    }
+    
+    // ============ ENCAMINHAMENTO ============
+    console.log('\n' + '='.repeat(80));
+    console.log('🚀 ENCAMINHANDO PARA DESTINO');
+    console.log('='.repeat(80));
+    
+    // Prepara headers para encaminhamento
+    const cleanReqHeaders = cleanHeaders(req.headers);
+    const forwardHeaders = {
+      ...cleanReqHeaders,
+      'x-forwarded-for': req.socket.remoteAddress,
+      'x-forwarded-host': req.headers.host || 'localhost',
+      'x-forwarded-proto': 'http',
+      'x-forwarded-port': req.headers.host ? req.headers.host.split(':')[1] || '80' : '80',
+      'x-proxy-server': 'node-interceptor-raw',
+      'x-original-url': req.url,
+      'x-proxy-timestamp': Date.now().toString()
+    };
+    
+    // Mantém Content-Type e Content-Length corretos
+    if (contentType) {
+      forwardHeaders['content-type'] = contentType;
+    }
+    
+    if (bodyBuffer.length > 0) {
+      forwardHeaders['content-length'] = bodyBuffer.length;
+    }
+    
+    const forwardPath = req.url;
+    const targetUrl = 'http://' + DESTINO.host + ':' + DESTINO.port + forwardPath;
+    
+    console.log('\n📤 DETALHES DO ENCAMINHAMENTO:');
+    console.log('─'.repeat(80));
+    console.log('  URL Destino: ' + targetUrl);
+    console.log('  Método: ' + req.method);
+    console.log('  Body Size: ' + bodyBuffer.length + ' bytes');
+    
+    console.log('\n📋 HEADERS ENCAMINHADOS:');
+    console.log('─'.repeat(80));
+    Object.keys(forwardHeaders).sort().forEach(function(key) {
+      const value = forwardHeaders[key];
+      if (key.toLowerCase() === 'authorization') {
+        const parts = value.split(' ');
+        if (parts.length === 2) {
+          console.log('  ' + key + ': ' + parts[0] + ' ' + parts[1].substring(0, 20) + '... (tamanho: ' + parts[1].length + ' chars)');
+        } else {
+          console.log('  ' + key + ': [PRESENTE]');
+        }
+      } else {
+        console.log('  ' + key + ': ' + value);
+      }
     });
-
-    // Retorna erro
-    const status = error.response ? error.response.status : 502;
-    const message = error.response ? error.response.data : error.message;
-
-    res.status(status).json({
-      error: 'Proxy Error',
-      message: message,
-      requestId: requestId,
-      timestamp: new Date().toISOString(),
-      details: error.message
+    
+    if (bodyBuffer.length > 0 && !isMultipart) {
+      console.log('\n📄 BODY ENCAMINHADO:');
+      console.log('─'.repeat(80));
+      if (contentType.includes('application/json')) {
+        try {
+          const jsonBody = JSON.parse(bodyString);
+          console.log(JSON.stringify(jsonBody, null, 2));
+        } catch {
+          console.log(bodyString);
+        }
+      } else {
+        console.log(bodyString);
+      }
+    }
+    
+    // ============ FAZER REQUISIÇÃO ============
+    const options = {
+      hostname: DESTINO.host,
+      port: DESTINO.port,
+      path: forwardPath,
+      method: req.method,
+      headers: forwardHeaders,
+      timeout: 30000
+    };
+    
+    const proxyReq = http.request(options, function(proxyRes) {
+      console.log('\n' + '='.repeat(80));
+      console.log('📨 RESPOSTA DO DESTINO');
+      console.log('='.repeat(80));
+      console.log('Status: ' + proxyRes.statusCode + ' ' + proxyRes.statusMessage);
+      
+      console.log('\n📋 HEADERS DA RESPOSTA:');
+      console.log('─'.repeat(80));
+      Object.keys(proxyRes.headers).sort().forEach(function(key) {
+        console.log('  ' + key + ': ' + proxyRes.headers[key]);
+      });
+      
+      let responseChunks = [];
+      proxyRes.on('data', function(chunk) {
+        responseChunks.push(chunk);
+      });
+      
+      proxyRes.on('end', function() {
+        const responseBody = Buffer.concat(responseChunks).toString();
+        
+        console.log('\n📄 BODY DA RESPOSTA:');
+        console.log('─'.repeat(80));
+        console.log('Tamanho: ' + responseBody.length + ' bytes');
+        
+        if (responseBody) {
+          try {
+            const jsonBody = JSON.parse(responseBody);
+            console.log(JSON.stringify(jsonBody, null, 2));
+          } catch {
+            console.log(responseBody);
+          }
+        } else {
+          console.log('(Resposta sem body)');
+        }
+        
+        console.log('\n' + '='.repeat(80) + '\n');
+        
+        // CORS headers
+        const corsHeaders = {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, PATCH',
+          'Access-Control-Allow-Headers': '*',
+          'Access-Control-Allow-Credentials': 'true'
+        };
+        
+        const headers = {
+          ...proxyRes.headers,
+          ...corsHeaders
+        };
+        
+        delete headers['connection'];
+        delete headers['transfer-encoding'];
+        
+        res.writeHead(proxyRes.statusCode, headers);
+        res.end(responseBody);
+      });
     });
-  }
-});
-
-// ===== ROTA OPTIONS =====
-app.options('*', (req, res) => {
-  res.set({
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, PATCH',
-    'Access-Control-Allow-Headers': '*',
-    'Access-Control-Max-Age': '86400',
-    'Access-Control-Allow-Credentials': 'true'
+    
+    proxyReq.on('error', function(error) {
+      console.error('\n' + '='.repeat(80));
+      console.error('❌ ERRO NO ENCAMINHAMENTO');
+      console.error('='.repeat(80));
+      console.error('Erro: ' + error.message);
+      console.error('Target: ' + targetUrl);
+      console.error('Stack: ' + error.stack);
+      
+      const corsHeaders = {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, PATCH',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Allow-Credentials': 'true',
+        'Content-Type': 'application/json'
+      };
+      
+      res.writeHead(500, corsHeaders);
+      res.end(JSON.stringify({
+        error: 'Erro no encaminhamento',
+        message: error.message,
+        target: targetUrl,
+        timestamp: new Date().toISOString()
+      }));
+    });
+    
+    proxyReq.on('timeout', function() {
+      console.error('\n⏰ TIMEOUT NO ENCAMINHAMENTO');
+      console.log('─'.repeat(80));
+      console.error('Target: ' + targetUrl);
+      console.error('Timeout: 30 segundos');
+      proxyReq.destroy();
+    });
+    
+    // Envia o body
+    if (bodyBuffer.length > 0) {
+      proxyReq.write(bodyBuffer);
+    }
+    proxyReq.end();
   });
-  res.sendStatus(204);
 });
 
-// ===== START SERVER =====
-app.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', function() {
   console.log('\n' + '='.repeat(80));
-  console.log('🚀 SERVIDOR PROXY EXPRESS');
+  console.log('🔍 SERVIDOR DE INSPEÇÃO DE REQUISIÇÕES');
   console.log('='.repeat(80));
-  console.log(`✅ Rodando em: http://localhost:${PORT}`);
-  console.log(`🎯 Encaminhando para: ${TARGET_SERVER.baseURL}`);
-  console.log(`📋 Health Check: http://localhost:${PORT}/health`);
-  console.log(`📊 Logs: http://localhost:${PORT}/logs`);
+  console.log('📡 Rodando em: http://localhost:' + PORT);
+  
+  const networkInterfaces = os.networkInterfaces();
+  console.log('\n🌐 ACESSÍVEL EM:');
+  Object.keys(networkInterfaces).forEach(function(interfaceName) {
+    networkInterfaces[interfaceName].forEach(function(iface) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        console.log('  ➜ http://' + iface.address + ':' + PORT);
+      }
+    });
+  });
+  
+  console.log('\n🎯 ENCAMINHANDO PARA: ' + DESTINO.host + ':' + DESTINO.port);
+  console.log('📝 Exemplo: /api/propostas/123 -> http://' + DESTINO.host + ':' + DESTINO.port + '/api/propostas/123');
+  console.log('\n💡 Todos os dados da requisição serão exibidos no console');
+  console.log('💾 Arquivos serão salvos em: ' + process.cwd() + '/uploads/');
+  console.log('\n⏹️  Pressione Ctrl+C para parar');
   console.log('='.repeat(80) + '\n');
-});
-
-// ===== TRATAMENTO DE ERROS =====
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection:', reason);
 });
