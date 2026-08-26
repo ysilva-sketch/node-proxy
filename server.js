@@ -7,8 +7,19 @@ const crypto = require('crypto');
 
 const PORT = 3000;
 const DESTINO = {
-  host: 'localhost',
-  port: 60913
+  host: 'api-svsaude-hcommerce.hmg.marlin.com.br',
+  port: 80
+};
+
+// ============ USER-AGENT PARA IPAD iOS 18.6 ============
+const USER_AGENT_IPAD = 'Mozilla/5.0 (iPad; CPU OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1';
+
+// Outras opções de User-Agent para iPad
+const USER_AGENTS = {
+  'ipad_ios_18_6': 'Mozilla/5.0 (iPad; CPU OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1',
+  'ipad_ios_18_5': 'Mozilla/5.0 (iPad; CPU OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+  'ipad_ios_17_6': 'Mozilla/5.0 (iPad; CPU OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1',
+  'ipad_ios_16_6': 'Mozilla/5.0 (iPad; CPU OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 };
 
 function parseMultipart(body, boundary) {
@@ -127,7 +138,7 @@ const server = http.createServer(function(req, res) {
     console.log('❓ Query String: ' + (parsedUrl.search || '(vazia)'));
     console.log('📌 Método: ' + req.method);
     console.log('🌐 IP Cliente: ' + req.socket.remoteAddress);
-    console.log('🖥️  User-Agent: ' + (req.headers['user-agent'] || '(não enviado)'));
+    console.log('🖥️  User-Agent Original: ' + (req.headers['user-agent'] || '(não enviado)'));
     console.log('📦 Content-Type: ' + (contentType || '(não enviado)'));
     console.log('📏 Content-Length: ' + (req.headers['content-length'] || '0'));
     
@@ -144,6 +155,8 @@ const server = http.createServer(function(req, res) {
         } else {
           console.log('  ' + key + ': ' + value.substring(0, 50) + '... (tamanho: ' + value.length + ' chars)');
         }
+      } else if (key.toLowerCase() === 'user-agent') {
+        console.log('  ' + key + ': ' + value);
       } else {
         console.log('  ' + key + ': ' + value);
       }
@@ -184,7 +197,6 @@ const server = http.createServer(function(req, res) {
         console.log('Tipo: MULTIPART/FORM-DATA');
         console.log('Boundary: ' + boundary);
         
-        // Mostra o body cru
         console.log('\n📄 BODY CRU (primeiros 1000 caracteres):');
         console.log('─'.repeat(80));
         console.log(bodyString.substring(0, 1000) + (bodyString.length > 1000 ? '...\n(continua...)' : ''));
@@ -211,7 +223,6 @@ const server = http.createServer(function(req, res) {
             console.log('    Content-Type: ' + file.contentType);
             console.log('    Tamanho: ' + (file.size / 1024).toFixed(2) + ' KB (' + file.size + ' bytes)');
             
-            // Detecta tipo do arquivo
             const hexPreview = Buffer.from(file.data.substring(0, 30)).toString('hex');
             let fileType = 'Desconhecido';
             const hex = hexPreview.toLowerCase();
@@ -228,7 +239,6 @@ const server = http.createServer(function(req, res) {
             console.log('    Dados (primeiros 200 bytes):');
             console.log('    ' + file.data.substring(0, 200).replace(/\n/g, '\\n').replace(/\r/g, '\\r') + (file.data.length > 200 ? '...' : ''));
             
-            // Salva o arquivo
             const uploadDir = './uploads';
             if (!fs.existsSync(uploadDir)) {
               fs.mkdirSync(uploadDir, { recursive: true });
@@ -286,15 +296,22 @@ const server = http.createServer(function(req, res) {
     
     // Prepara headers para encaminhamento
     const cleanReqHeaders = cleanHeaders(req.headers);
+    
+    // ============ SUBSTITUI O USER-AGENT ============
+    // Remove o User-Agent original se existir
+    delete cleanReqHeaders['user-agent'];
+    
     const forwardHeaders = {
       ...cleanReqHeaders,
+      'user-agent': USER_AGENT_IPAD, // <-- NOVO USER-AGENT DO IPAD
       'x-forwarded-for': req.socket.remoteAddress,
       'x-forwarded-host': req.headers.host || 'localhost',
       'x-forwarded-proto': 'http',
       'x-forwarded-port': req.headers.host ? req.headers.host.split(':')[1] || '80' : '80',
       'x-proxy-server': 'node-interceptor-raw',
       'x-original-url': req.url,
-      'x-proxy-timestamp': Date.now().toString()
+      'x-proxy-timestamp': Date.now().toString(),
+      'x-original-user-agent': req.headers['user-agent'] || '(none)' // Guarda o original para debug
     };
     
     // Mantém Content-Type e Content-Length corretos
@@ -307,13 +324,16 @@ const server = http.createServer(function(req, res) {
     }
     
     const forwardPath = req.url;
-    const targetUrl = 'http://' + DESTINO.host + ':' + DESTINO.port + forwardPath;
+    const targetUrl = 'https://' + DESTINO.host + ':' + DESTINO.port + forwardPath;
     
     console.log('\n📤 DETALHES DO ENCAMINHAMENTO:');
     console.log('─'.repeat(80));
     console.log('  URL Destino: ' + targetUrl);
     console.log('  Método: ' + req.method);
     console.log('  Body Size: ' + bodyBuffer.length + ' bytes');
+    console.log('\n  🔄 SUBSTITUIÇÃO DE USER-AGENT:');
+    console.log('  Original: ' + (req.headers['user-agent'] || '(não enviado)'));
+    console.log('  Novo: ' + USER_AGENT_IPAD);
     
     console.log('\n📋 HEADERS ENCAMINHADOS:');
     console.log('─'.repeat(80));
@@ -326,6 +346,10 @@ const server = http.createServer(function(req, res) {
         } else {
           console.log('  ' + key + ': [PRESENTE]');
         }
+      } else if (key.toLowerCase() === 'user-agent') {
+        console.log('  ' + key + ': ' + value + ' ✅ (SUBSTITUÍDO)');
+      } else if (key.toLowerCase() === 'x-original-user-agent') {
+        console.log('  ' + key + ': ' + value + ' (original)');
       } else {
         console.log('  ' + key + ': ' + value);
       }
@@ -472,7 +496,10 @@ server.listen(PORT, '0.0.0.0', function() {
   });
   
   console.log('\n🎯 ENCAMINHANDO PARA: ' + DESTINO.host + ':' + DESTINO.port);
-  console.log('📝 Exemplo: /api/propostas/123 -> http://' + DESTINO.host + ':' + DESTINO.port + '/api/propostas/123');
+  console.log('📱 USER-AGENT SUBSTITUÍDO PARA:');
+  console.log('   ' + USER_AGENT_IPAD);
+  console.log('\n📝 Exemplo: /api/propostas/123 -> http://' + DESTINO.host + ':' + DESTINO.port + '/api/propostas/123');
+  console.log('   (com User-Agent de iPad iOS 18.6)');
   console.log('\n💡 Todos os dados da requisição serão exibidos no console');
   console.log('💾 Arquivos serão salvos em: ' + process.cwd() + '/uploads/');
   console.log('\n⏹️  Pressione Ctrl+C para parar');
